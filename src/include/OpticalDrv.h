@@ -1,8 +1,7 @@
 #ifndef _OPTICAL_DRV_H_
 #define _OPTICAL_DRV_H_
 
-#define DEVICE_NODE_FORMAT    "IRTouchOptical%03d"
-#define OPTICAL_TOUCH_POINT_COUNT 2
+#define OPTICAL_MAX_TOUCH_POINTS 10
 
 #pragma pack(1)
 
@@ -30,12 +29,18 @@ OpticalReportPacketSingleTouch;
 
 typedef struct _OpticalReportPacketMultiTouch
 {
-    OpticalReportTouchPoint touchPoint[OPTICAL_TOUCH_POINT_COUNT];
+    OpticalReportTouchPoint touchPoint[OPTICAL_MAX_TOUCH_POINTS];
     unsigned short scanTime;
 }
 OpticalReportPacketMultiTouch;
 
 #pragma pack()
+
+struct optical_variant
+{
+    const char *device_node_format;
+    unsigned int touch_point_count;
+};
 
 //control code
 #define OPTICAL_IOCTL_CODE_TYPE_MASK                        0x00ff0000u
