@@ -7,6 +7,7 @@
 #include <linux/usb/input.h>
 #include <linux/hid.h>
 #include <linux/delay.h>
+#include <linux/mutex.h>
 #include <linux/cdev.h>
 #include <linux/uaccess.h>
 #include <linux/input/mt.h>
@@ -55,6 +56,10 @@ typedef struct _device_context
     unsigned char *buffer; //OTD: 10 × 9 + 2 = 92
     unsigned int buffer_length;
 
+    bool urb_submitted;
+    bool input_device_open;
+    bool disconnected;
+
     device_context_pool pool;
 }
 device_context;
@@ -85,20 +90,60 @@ static struct usb_device_id const dev_table[] =
 
 static struct usb_driver optical_driver;
 static struct file_operations optical_fops;
+static DEFINE_MUTEX(optical_file_lock);
 
-static void submit_urb(device_context* optical)
+static int submit_urb(device_context* optical, gfp_t gfp_mask)
 {
     int retval;
 
-    retval = usb_submit_urb(optical->interrupt_urb, GFP_KERNEL);
+    retval = usb_submit_urb(optical->interrupt_urb, gfp_mask);
     if (retval != 0)
     {
-        return;
+        err("%s: usb_submit_urb failed: %d", __func__, retval);
     }
+    return retval;
 }
 static void cancel_urb(device_context* device)
 {
     usb_kill_urb(device->interrupt_urb);
+}
+
+static bool optical_has_active_consumer(device_context* optical)
+{
+    return optical->file_private_data != NULL || optical->input_device_open;
+}
+
+static int optical_ensure_urb_started(device_context* optical, gfp_t gfp_mask)
+{
+    int retval;
+
+    mutex_lock(&optical_file_lock);
+    if (optical->disconnected)
+    {
+        mutex_unlock(&optical_file_lock);
+        return -ENODEV;
+    }
+    if (optical->urb_submitted)
+    {
+        mutex_unlock(&optical_file_lock);
+        return 0;
+    }
+    retval = submit_urb(optical, gfp_mask);
+    optical->urb_submitted = retval == 0;
+    mutex_unlock(&optical_file_lock);
+    return retval;
+}
+
+static void optical_maybe_stop_urb(device_context* optical)
+{
+    mutex_lock(&optical_file_lock);
+    if (!optical->disconnected && optical->urb_submitted &&
+        !optical_has_active_consumer(optical))
+    {
+        optical->urb_submitted = false;
+        cancel_urb(optical);
+    }
+    mutex_unlock(&optical_file_lock);
 }
 
 static ssize_t optical_read(struct file * filp, char * buffer, size_t count, loff_t * ppos)
@@ -373,6 +418,7 @@ static int optical_open(struct inode * inode, struct file * filp)
 {
     device_context* optical;
     struct usb_interface* interface;
+    int retval;
     int subminor;
 
     subminor = iminor(inode);
@@ -385,26 +431,54 @@ static int optical_open(struct inode * inode, struct file * filp)
         return -1;
     }
     optical = usb_get_intfdata(interface);
+    if (optical == NULL)
+    {
+        return -ENODEV;
+    }
+
+    mutex_lock(&optical_file_lock);
     if (optical->file_private_data != NULL)
     {
+        mutex_unlock(&optical_file_lock);
         return -EFAULT;
     }
     optical->file_private_data = &filp->private_data;
     filp->private_data = optical;
+    mutex_unlock(&optical_file_lock);
 
-    return 0;
+    retval = optical_ensure_urb_started(optical, GFP_KERNEL);
+    if (retval == 0)
+    {
+        return 0;
+    }
+
+    mutex_lock(&optical_file_lock);
+    if (optical->file_private_data == &filp->private_data)
+    {
+        optical->file_private_data = NULL;
+    }
+    filp->private_data = NULL;
+    mutex_unlock(&optical_file_lock);
+    return retval;
 }
 
 static int optical_release(struct inode * inode, struct file * filp)
 {
     device_context* device;
 
+    mutex_lock(&optical_file_lock);
     device = filp->private_data;
     if (device != NULL)
     {
         device->file_private_data = NULL;
     }
     filp->private_data = NULL;
+    mutex_unlock(&optical_file_lock);
+
+    if (device != NULL)
+    {
+        optical_maybe_stop_urb(device);
+    }
 
     return 0;
 }
@@ -448,7 +522,19 @@ static void on_interrupt(struct urb* interrupt_urb)
     }
     spin_unlock(&optical->lock);
 
-    submit_urb(optical);
+    /* Flag reads are lockless: worst case is one extra URB cycle before a
+     * stop takes effect, which is harmless. A mutex cannot be used here
+     * because this is interrupt context. */
+    if (optical->disconnected || !optical->urb_submitted ||
+        !optical_has_active_consumer(optical))
+    {
+        return;
+    }
+
+    if (submit_urb(optical, GFP_ATOMIC) != 0)
+    {
+        optical->urb_submitted = false;
+    }
 }
 
 static int optical_open_device(struct input_dev * input_dev)
@@ -458,8 +544,11 @@ static int optical_open_device(struct input_dev * input_dev)
     optical = input_get_drvdata(input_dev);
     info("%s", __func__);
 
-    submit_urb(optical);
-    return 0;
+    mutex_lock(&optical_file_lock);
+    optical->input_device_open = true;
+    mutex_unlock(&optical_file_lock);
+
+    return optical_ensure_urb_started(optical, GFP_KERNEL);
 }
 
 static void optical_close_device(struct input_dev * input_dev)
@@ -469,7 +558,11 @@ static void optical_close_device(struct input_dev * input_dev)
     device = input_get_drvdata(input_dev);
     info("%s", __func__);
 
-    cancel_urb(device);
+    mutex_lock(&optical_file_lock);
+    device->input_device_open = false;
+    mutex_unlock(&optical_file_lock);
+
+    optical_maybe_stop_urb(device);
 }
 
 static void device_context_init(device_context* obj, struct usb_interface* intf)
@@ -628,13 +721,17 @@ static int optical_probe(struct usb_interface * intf, const struct usb_device_id
                         } while (false);
                         //ԭ��û�е���input_unregister_device
                         input_unregister_device(optical->input_dev);
+                        optical->input_dev = NULL;
                     } while (false);
                     usb_free_urb(optical->interrupt_urb);
                 } while (false);
                 usb_free_coherent(optical->usb_device, optical->buffer_capacity, optical->ongoing_buffer, optical->ongoing_buffer_dma);
             } while (false);
             kfree(optical->buffer);
-            input_free_device(optical->input_dev);
+            if (optical->input_dev != NULL)
+            {
+                input_free_device(optical->input_dev);
+            }
         } while (false);
         if (optical->file_private_data != NULL)
         {
@@ -650,20 +747,25 @@ static void optical_disconnect(struct usb_interface * intf)
 {
     device_context* optical = usb_get_intfdata(intf);
 
-    optical = usb_get_intfdata(intf);
-
     usb_deregister_dev(intf, &optical->class);
     usb_set_intfdata(intf, NULL);
-    input_unregister_device(optical->input_dev);
-    usb_free_urb(optical->interrupt_urb);
-    usb_free_coherent(optical->usb_device, optical->buffer_capacity, optical->ongoing_buffer, optical->ongoing_buffer_dma);
-    kfree(optical->buffer);
-    input_free_device(optical->input_dev);
+
+    mutex_lock(&optical_file_lock);
+    optical->disconnected = true;
+    optical->urb_submitted = false;
+    optical->input_device_open = false;
     if (optical->file_private_data != NULL)
     {
         (*optical->file_private_data) = NULL;
     }
     optical->file_private_data = NULL;
+    mutex_unlock(&optical_file_lock);
+
+    cancel_urb(optical);
+    input_unregister_device(optical->input_dev);
+    usb_free_urb(optical->interrupt_urb);
+    usb_free_coherent(optical->usb_device, optical->buffer_capacity, optical->ongoing_buffer, optical->ongoing_buffer_dma);
+    kfree(optical->buffer);
     kfree(optical);
 }
 
