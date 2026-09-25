@@ -3,7 +3,8 @@
 
 #define OPTICAL_MAX_TOUCH_POINTS 10
 
-#pragma pack(1)
+#define OPTICAL_MULTITOUCH_PACKET_SIZE(touch_point_count) \
+    ((touch_point_count) * sizeof(OpticalReportTouchPoint) + sizeof(unsigned short))
 
 typedef unsigned char OpticalReportTouchPointStateFlag;
 #define OpticalReportTouchPointStateFlag_None       ((OpticalReportTouchPointStateFlag)0x00)
@@ -18,23 +19,21 @@ typedef struct _OpticalReportTouchPoint
     signed short width;
     signed short height;
 }
-OpticalReportTouchPoint;
+__attribute__((packed)) OpticalReportTouchPoint;
 
 typedef struct _OpticalReportPacketSingleTouch
 {
     OpticalReportTouchPoint touchPoint;
     unsigned short scanTime;
 }
-OpticalReportPacketSingleTouch;
+__attribute__((packed)) OpticalReportPacketSingleTouch;
 
 typedef struct _OpticalReportPacketMultiTouch
 {
     OpticalReportTouchPoint touchPoint[OPTICAL_MAX_TOUCH_POINTS];
     unsigned short scanTime;
 }
-OpticalReportPacketMultiTouch;
-
-#pragma pack()
+__attribute__((packed)) OpticalReportPacketMultiTouch;
 
 struct optical_variant
 {

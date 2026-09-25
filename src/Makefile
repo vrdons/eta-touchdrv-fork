@@ -2,6 +2,9 @@ MODULE = OpticalDrv
 
 ccflags-y += -I$(src)/include
 
+
+C_FLAGS = -Wall
+
 ifneq ($(KERNELRELEASE),)
 obj-m := $(MODULE).o
 else
